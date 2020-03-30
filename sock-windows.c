@@ -31,3 +31,13 @@ void socket_close(int fd)
 		assert(0);
 	}
 }
+
+void perror(const char *s) {
+    char error_message[1024];
+
+    FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+               NULL, WSAGetLastError(), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), 
+               error_message, sizeof(error_message), NULL);
+
+    fprintf(stderr, "%s: %s", s, error_message);
+}

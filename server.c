@@ -1,20 +1,26 @@
-#define __USE_MINGW_ANSI_STDIO 1
 #include <assert.h>
 #include <stdio.h>
+#include <libgen.h>
 #include <stdint.h>
+
 #include <string.h>
 #include <errno.h>
+
+#include <unistd.h>
 
 #include <vmci_sockets.h>
 
 #include "sock-portable.h"
 
+BOOL DGRAM = FALSE;
+
 char *program_name;
 
 void print_usage_exit(void)
 {
-    fprintf(stderr, "usage: %s <PORT|0>\n", program_name);
-    fprintf(stderr, "\t0 - port auto selection\n");
+    fprintf(stderr, "usage: %s [-d] [PORT]\n", program_name);
+    fprintf(stderr, "  -d: use DATAGRAM mode instead of STREAM mode\n");
+    fprintf(stderr, "  no PORT means port auto selection\n");
     exit(2);
 }
 
@@ -25,10 +31,10 @@ enum {
 
 int main(int argc, char **argv)
 {
-    unsigned int server_cid, server_port;
+    unsigned int server_cid = 0, server_port = 0;
     int listen_fd, client_fd, nfds;
     uint64_t buf_size, t;
-    socklen_t size;
+    socklen_t size, their_addr_size;
     struct sockaddr_vm my_addr = {0}, their_addr;
     int vmci_address_family;
     fd_set read_fds;
@@ -37,12 +43,23 @@ int main(int argc, char **argv)
 
     program_name = basename(argv[0]);
 
-    if (argc != 2)
-        print_usage_exit();
+    int option;
+    while((option = getopt(argc, argv, ":dh")) != -1){ 
+        switch(option){
+        case 'd':
+            DGRAM = TRUE;
+            break;
+        case 'h':
+        case '?':
+            print_usage_exit();
+            break;
+        }
+    }
 
-    server_port = (unsigned int)strtoul(argv[1], &p, 0);
-    assert(*p == '\0');
-
+    for(; optind < argc; optind++){ //when some extra arguments are passed
+        server_port = (unsigned int)strtoul(argv[optind], &p, 0);
+    }
+     
     if (server_port == 0) 
          server_port = VMADDR_PORT_ANY;
 
@@ -53,32 +70,37 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    if ((listen_fd = socket(vmci_address_family, SOCK_STREAM, 0)) == -1) {
+    int socket_type;
+    socket_type = DGRAM ? SOCK_DGRAM : SOCK_STREAM;
+
+    if ((listen_fd = socket(vmci_address_family, socket_type, 0)) == -1) {
         perror("socket");
         goto cleanup;
     }
 
-    /*
-     * SO_VMCI_BUFFER_SIZE – Default size of communicating buffers; 65536 bytes if not set.
-     * SO_VMCI_BUFFER_MIN_SIZE – Minimum size of communicating buffers; defaults to 128 bytes.
-     * SO_VMCI_BUFFER_MAX_SIZE – Maximum size of communicating buffers; defaults to 262144 bytes.
-     */
+    if (!DGRAM) { 
+        /*
+        * SO_VMCI_BUFFER_SIZE – Default size of communicating buffers; 65536 bytes if not set.
+        * SO_VMCI_BUFFER_MIN_SIZE – Minimum size of communicating buffers; defaults to 128 bytes.
+        * SO_VMCI_BUFFER_MAX_SIZE – Maximum size of communicating buffers; defaults to 262144 bytes.
+        */
 
-    buf_size = 32768;
-    /* reduce buffer to above size and check */
-    if (setsockopt(listen_fd, vmci_address_family, SO_VMCI_BUFFER_SIZE, (void *)&buf_size, sizeof(buf_size)) == -1) {
-        perror("setsockopt");
-        goto close;
-    }
+        buf_size = 32768;
+        /* reduce buffer to above size and check */
+        if (setsockopt(listen_fd, vmci_address_family, SO_VMCI_BUFFER_SIZE, (void *)&buf_size, sizeof(buf_size)) == -1) {
+            perror("setsockopt");
+            goto close;
+        }
 
-    size = sizeof(t);
-    if (getsockopt(listen_fd, vmci_address_family, SO_VMCI_BUFFER_SIZE, (void *)&t, &size) == -1) {
-        perror("getsockopt");
-        goto close;
-    }
-    if (t != buf_size) {
-        fprintf(stderr, "SO_VMCI_BUFFER_SIZE not set to size requested.\n");
-        goto close;
+        size = sizeof(t);
+        if (getsockopt(listen_fd, vmci_address_family, SO_VMCI_BUFFER_SIZE, (void *)&t, &size) == -1) {
+            perror("getsockopt");
+            goto close;
+        }
+        if (t != buf_size) {
+            fprintf(stderr, "SO_VMCI_BUFFER_SIZE not set to size requested.\n");
+            goto close;
+        }
     }
 
     my_addr.svm_family = vmci_address_family;
@@ -100,47 +122,60 @@ int main(int argc, char **argv)
         perror("getsockname");
         goto close;
     }
-
-    fprintf(stderr, "listening on %u:%u\n", server_cid, my_addr.svm_port);
+//     fprintf(stderr, "listening %u:%u at %s mode\n", my_addr.svm_cid, my_addr.svm_port, DGRAM ? "DATAGRAM" : "STREAM");
+    fprintf(stderr, "listening %u:%u at %s mode\n", server_cid, my_addr.svm_port, DGRAM ? "DATAGRAM" : "STREAM");
 
 // disable buffering
 //     setvbuf ( stdout , NULL , _IONBF , 1024 );
 
     for (;;) {
-        if (listen(listen_fd, CONNECTION_BACKLOG) == -1) {
-            perror("listen");
-            goto close;
-        }
+        int numbytes;
+        their_addr_size = sizeof(their_addr);
 
-        size = sizeof(their_addr);
-        if ((client_fd = accept(listen_fd, (struct sockaddr *) &their_addr, &size)) == -1) {
-            perror("accept");
-            goto close;
-        }
-        fprintf(stderr, "client connected\n");
+        if (!DGRAM) {
+        // STREAM mode
+            if (listen(listen_fd, CONNECTION_BACKLOG) == -1) {
+                perror("listen");
+                goto close;
+            }
 
-        FD_ZERO(&read_fds);
-        FD_SET(client_fd, &read_fds);
-        nfds = client_fd + 1;
-        if (select(nfds, &read_fds, NULL, NULL, NULL) == -1) {
-            perror("select");
-            goto close;
-        }
-        if (FD_ISSET(client_fd, &read_fds)) {
-            ssize_t s;
-            if ((s = recv(client_fd, (void*)buf, sizeof(buf), 0)) < 0) {
+            their_addr_size = sizeof(their_addr);
+            if ((client_fd = accept(listen_fd, (struct sockaddr *) &their_addr, &their_addr_size)) == -1) {
+                perror("accept");
+                goto close;
+            }
+            fprintf(stderr, "client connected\n");
+
+            FD_ZERO(&read_fds);
+            FD_SET(client_fd, &read_fds);
+            nfds = client_fd + 1;
+            if (select(nfds, &read_fds, NULL, NULL, NULL) == -1) {
+                perror("select");
+                goto close;
+            }
+            if (!FD_ISSET(client_fd, &read_fds)) {
+                fprintf(stderr, "FD_ISSET failed\n");
+                goto close;
+            }
+
+            numbytes = recv(client_fd, (void*)buf, sizeof(buf), 0);
+            if (numbytes < 0) {
                 fprintf(stderr, "recv failed: %s\n", strerror(errno));
-            } else {
-                int i;
-                fprintf(stderr, "recved %lld bytes\n", (long long int)s);
-                for (i=0; i<s; i++) {
-                    putc(buf[i], stdout);
-                }
-//              putc('\n', stdout);
-                fflush(stdout);
+            }
+           
+            close(client_fd);
+        } else {
+        // DATAGRAM mode
+            numbytes = recvfrom(listen_fd, (void*)buf, sizeof(buf), 0, (struct sockaddr *) &their_addr, &their_addr_size);
+            if (numbytes < 0) {
+                fprintf(stderr, "recvfrom failed: %s\n", strerror(errno));
             }
         }
-        close(client_fd);
+
+        fprintf(stderr, "received %u bytes from %u:%u\n", numbytes, their_addr.svm_cid, their_addr.svm_port);
+
+        fwrite(buf, 1, numbytes, stdout);
+        fflush(stdout);
     }
 close:
     socket_close(listen_fd);
